@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 import webbrowser
 import concurrent.futures
 
+
 class VideoGPSProcessor:
     @staticmethod
     def interpolate_gps_in_csv(csv_path, start_frame, end_frame, video_name, gps_coords):
@@ -680,7 +681,6 @@ class VideoGPSProcessor:
 
         # Add markers only for every 100m chainage
         chainage_intervals = set([round(x, 1) for x in np.arange(0, df['Chainage'].max() + 0.1, 0.1)])
-
         added_markers = set()
 
         for _, row in df.iterrows():
@@ -693,31 +693,131 @@ class VideoGPSProcessor:
                     icon=folium.Icon(color="red", icon="info-sign")
                 ).add_to(m)
                 added_markers.add(closest_chainage)
+
+        # Convert relevant data to JSON for JavaScript
+        route_data = df[['Latitude', 'Longitude', 'Chainage', 'Startframe', 'Video_Name', 'Position']].to_json(orient='records')
         
-        # First add the built-in click handler
-        folium.LatLngPopup().add_to(m)
+        # Create HTML for the toggle button
+        toggle_html = """
+        <div id="toggle-container" 
+            style="position: absolute; top: 10px; right: 10px; z-index: 1000; background: white; 
+                    padding: 10px; border-radius: 4px; box-shadow: 0 1px 5px rgba(0,0,0,0.4);">
+            <button id="toggle-mode" 
+                    style="padding: 8px 12px; background-color: #fff; border: 2px solid #ccc; 
+                        border-radius: 5px; cursor: pointer; font-weight: bold;">
+                Toggle LatLng Mode
+            </button>
+        </div>
+        """
         
-        # Then add a custom JavaScript to modify the popup content format
-        custom_js = """
+        # Add the toggle HTML to the map
+        m.get_root().html.add_child(folium.Element(toggle_html))
+        
+        # Add comprehensive JavaScript for toggle functionality
+        custom_js = f"""
         <script>
-            document.addEventListener('DOMContentLoaded', function() {
-                var map = document.querySelector('.folium-map');
-                    if (map) {
-                        map.addEventListener('click', function(e) {
-                            setTimeout(function() {
-                                var popup = document.querySelector('.leaflet-popup-content');
-                                if (popup) {
-                                    var latLng = popup.innerText.match(/-?\\d+\\.\\d+/g);
-                                    if (latLng && latLng.length >= 2) {
-                                        var lat = parseFloat(latLng[0]).toFixed(6);
-                                        var lng = parseFloat(latLng[1]).toFixed(6);
-                                        popup.innerText = lat + ", " + lng;
-                                    }
-                                }
-                            }, 100);
-                        });
-                    }
-                });
+            // Store route data for data display
+            var routeData = {route_data};
+            var isLatLngMode = false;
+            var latLngPopup = null;
+            
+            // Function to find closest point in the dataset
+            function findClosestPoint(clickLatLng) {{
+                var minDistance = Infinity;
+                var closestPoint = null;
+                
+                for (var i = 0; i < routeData.length; i++) {{
+                    var latLng = L.latLng(routeData[i].Latitude, routeData[i].Longitude);
+                    var distance = clickLatLng.distanceTo(latLng);
+                    
+                    if (distance < minDistance) {{
+                        minDistance = distance;
+                        closestPoint = routeData[i];
+                    }}
+                }}
+                
+                // Only return if we're within 30 meters of the line
+                if (minDistance > 100) {{
+                    return null;
+                }}
+                
+                return closestPoint;
+            }}
+            
+            // Initialize map functionality when the page is fully loaded
+            window.addEventListener('load', function() {{
+                // Make sure the map is fully initialized
+                setTimeout(function() {{
+                    try {{
+                        // Get map object (more robust way)
+                        var map = Object.values(window).find(function(obj) {{ 
+                            return obj && obj._container && obj instanceof L.Map;
+                        }});
+                        
+                        if (!map) {{
+                            console.error("Could not find map object");
+                            return;
+                        }}
+                        
+                        // Create a LatLng popup that we can control
+                        latLngPopup = L.popup();
+                        
+                        // Get toggle button
+                        var toggleButton = document.getElementById('toggle-mode');
+                        
+                        if (toggleButton) {{
+                            console.log("Toggle button found");
+                            // Add click event to toggle button
+                            toggleButton.addEventListener('click', function() {{
+                                isLatLngMode = !isLatLngMode;
+                                this.style.backgroundColor = isLatLngMode ? '#4CAF50' : '#fff';
+                                this.style.color = isLatLngMode ? '#fff' : '#000';
+                                this.textContent = isLatLngMode ? 'LatLng Mode Active' : 'Data Display Mode';
+                                console.log("Mode toggled:", isLatLngMode);
+                            }});
+                        }} else {{
+                            console.error("Toggle button not found");
+                        }}
+                        
+                        // Handle map clicks
+                        map.on('click', function(e) {{
+                            if (isLatLngMode) {{
+                                // Display coordinates in LatLng mode
+                                var lat = e.latlng.lat.toFixed(6);
+                                var lng = e.latlng.lng.toFixed(6);
+                                latLngPopup
+                                    .setLatLng(e.latlng)
+                                    .setContent(lat + ", " + lng)
+                                    .openOn(map);
+                            }} else {{
+                                // Display data from CSV in data mode
+                                var closestPoint = findClosestPoint(e.latlng);
+                                
+                                if (closestPoint && closestPoint.Position) {{
+                                    var popupContent = `
+                                        <div style="font-family: Arial, sans-serif; padding: 5px;">
+                                            <strong>Video:</strong> ${{closestPoint.Video_Name}}<br>
+                                            <strong>Frame:</strong> ${{closestPoint.Startframe}}<br>
+                                            <strong>Chainage:</strong> ${{closestPoint.Chainage.toFixed(3)}} km<br>
+                                            <strong>GPS:</strong> ${{closestPoint.Position}}<br>
+                                            <strong>Coordinates:</strong> ${{closestPoint.Latitude.toFixed(6)}}, ${{closestPoint.Longitude.toFixed(6)}}
+                                        </div>
+                                    `;
+                                    
+                                    L.popup()
+                                        .setLatLng([closestPoint.Latitude, closestPoint.Longitude])
+                                        .setContent(popupContent)
+                                        .openOn(map);
+                                }}
+                            }}
+                        }});
+                        
+                        console.log("Map functionality initialized successfully");
+                    }} catch (error) {{
+                        console.error("Error initializing map functionality:", error);
+                    }}
+                }}, 1000); // Give the map 1 second to fully initialize
+            }});
         </script>
         """
         
@@ -728,7 +828,6 @@ class VideoGPSProcessor:
         m.save(output_html)
         print(f"Map saved as {output_html}.")
         return output_html
-
 def process_and_generate_map(csv_path, start_frame, end_frame, video_name, gps_coords):
     interpolator = VideoGPSProcessor()
     
@@ -742,23 +841,19 @@ def process_and_generate_map(csv_path, start_frame, end_frame, video_name, gps_c
     output_dir = os.path.dirname(csv_path)
     
     # Define the output file paths
-    updated_csv_path = os.path.join(output_dir, "updated_output.csv")
-    map_html_path = os.path.join(output_dir, "updated_map.html")
+    updated_csv_path = os.path.join(output_dir, "processed_output.csv")
+    map_html_path = os.path.join(output_dir, "processed_output_map.html")
     
     # Save the updated CSV
     df.to_csv(updated_csv_path, index=False)
     
     # Generate the map
-    map_path = interpolator.create_map(updated_csv_path, map_html_path)
+    map_path = interpolator.create_map(updated_csv_path, map_html_path)    
+    # Open the map in a new browser tab
+    webbrowser.open(f"file://{os.path.abspath(map_path)}")
     
     return f"Interpolation completed. Updated CSV saved at {updated_csv_path}. Map generated at {map_path}"
-# def process_and_generate_map(csv_path, start_frame, end_frame, video_name, gps_coords):
-#     interpolator = VideoGPSProcessor()
-#     df = interpolator.interpolate_gps_in_csv(csv_path, start_frame, end_frame, video_name, gps_coords)
-#     df = interpolator.recalculate_chainage(df)
-#     df.to_csv("final_output.csv", index=False)
-#     map_path = interpolator.create_map("final_output.csv", "map.html")
-#     return f"Interpolation completed. Map generated at {map_path}"
+
 def create_gradio_interface():
     """Create Gradio interface for video GPS processing"""
     processor = VideoGPSProcessor()
@@ -831,11 +926,6 @@ def create_gradio_interface():
             )
     
     return demo
-import os
-import glob
-import re
-import concurrent.futures
-import webbrowser
 
 def process_videos(self, directory_path):
     """
