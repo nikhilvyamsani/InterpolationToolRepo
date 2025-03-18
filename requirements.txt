@@ -1,0 +1,12 @@
+gradio
+numpy
+pandas
+scipy
+folium
+geopy
+opencv-python
+regex
+subprocess32
+datetime
+webbrowser
+concurrent.futures
