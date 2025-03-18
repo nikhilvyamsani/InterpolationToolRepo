@@ -19,6 +19,7 @@ Install Python dependencies:
  
 Set up ExifTool:
  chmod +x exiftool
+ 
 Usage :
 
 Process Videos:
