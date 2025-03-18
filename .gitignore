@@ -14,3 +14,4 @@ Thumbs.db
 # Ignore IDE/editor configurations
 .vscode/
 .idea/
+.gradio/
