@@ -11,7 +11,7 @@ Gradio Interface: User-friendly interface for processing videos, deleting frames
 
 Installation
 Clone the repository: 
- git clone https://github.com/your-username/video-gps-processing-tool.git
+ git clone https://github.com/nikhilvyamsani/video-gps-processing-tool.git
  cd video-gps-processing-tool
 
 Install Python dependencies:
