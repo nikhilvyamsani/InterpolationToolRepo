@@ -5,6 +5,7 @@ from scipy.interpolate import CubicSpline, interp1d
 import numpy as np
 import pandas as pd
 import folium
+from folium.plugins import MousePosition
 import geopy.distance
 import cv2
 import re
@@ -666,7 +667,7 @@ class VideoGPSProcessor:
         if len(df) == 0:
             print("No valid GPS coordinates found for mapping")
             return None
-            
+                
         # Initialize map
         start_coords = (df.loc[0, 'Latitude'], df.loc[0, 'Longitude'])
         m = folium.Map(location=start_coords, zoom_start=15)
@@ -693,10 +694,41 @@ class VideoGPSProcessor:
                 ).add_to(m)
                 added_markers.add(closest_chainage)
         
+        # First add the built-in click handler
+        folium.LatLngPopup().add_to(m)
+        
+        # Then add a custom JavaScript to modify the popup content format
+        custom_js = """
+        <script>
+            document.addEventListener('DOMContentLoaded', function() {
+                var map = document.querySelector('.folium-map');
+                    if (map) {
+                        map.addEventListener('click', function(e) {
+                            setTimeout(function() {
+                                var popup = document.querySelector('.leaflet-popup-content');
+                                if (popup) {
+                                    var latLng = popup.innerText.match(/-?\\d+\\.\\d+/g);
+                                    if (latLng && latLng.length >= 2) {
+                                        var lat = parseFloat(latLng[0]).toFixed(6);
+                                        var lng = parseFloat(latLng[1]).toFixed(6);
+                                        popup.innerText = lat + ", " + lng;
+                                    }
+                                }
+                            }, 100);
+                        });
+                    }
+                });
+        </script>
+        """
+        
+        # Add the custom JS to the map
+        m.get_root().html.add_child(folium.Element(custom_js))
+        
         # Save map
         m.save(output_html)
         print(f"Map saved as {output_html}.")
         return output_html
+
 def process_and_generate_map(csv_path, start_frame, end_frame, video_name, gps_coords):
     interpolator = VideoGPSProcessor()
     
