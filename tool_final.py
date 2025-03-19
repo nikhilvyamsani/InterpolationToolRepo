@@ -664,7 +664,8 @@ class VideoGPSProcessor:
         
         # Filter out invalid coordinates (0,0)
         df = df[(df['Latitude'] != 0) | (df['Longitude'] != 0)]
-        
+        df = df.sort_values(by="Chainage").reset_index(drop=True)
+        df = df.drop_duplicates(subset=['Latitude', 'Longitude'])
         if len(df) == 0:
             print("No valid GPS coordinates found for mapping")
             return None
@@ -673,26 +674,43 @@ class VideoGPSProcessor:
         start_coords = (df.loc[0, 'Latitude'], df.loc[0, 'Longitude'])
         m = folium.Map(location=start_coords, zoom_start=15)
 
-        # Draw polyline
+        # Draw polyline for the entire route
         folium.PolyLine(
             list(zip(df['Latitude'], df['Longitude'])), 
             color="blue", weight=3, opacity=0.7
         ).add_to(m)
 
-        # Add markers only for every 100m chainage
-        chainage_intervals = set([round(x, 1) for x in np.arange(0, df['Chainage'].max() + 0.1, 0.1)])
-        added_markers = set()
-
-        for _, row in df.iterrows():
-            closest_chainage = min(chainage_intervals, key=lambda x: abs(x - row['Chainage']))
+        # Group by video name to identify start and end frames
+        video_groups = df.groupby('Video_Name')
         
-            if closest_chainage not in added_markers:
+        # Create markers for start and end frames of each video
+        for video_name, group in video_groups:
+            # Sort by Startframe to ensure proper start/end identification
+            group = group.sort_values(by="Startframe").reset_index(drop=True)
+            
+            if len(group) > 0:
+                # Add marker for the start frame
+                start_row = group.iloc[0]
                 folium.Marker(
-                    location=(row['Latitude'], row['Longitude']),
-                    popup=f"Chainage: {float(row['Chainage'])}km<br>Frame: {row['Startframe']}<br>Video: {row['Video_Name']}<br>GPS: {row['Position']}",
-                    icon=folium.Icon(color="red", icon="info-sign")
+                    location=(start_row['Latitude'], start_row['Longitude']),
+                    popup=f"<b>START:</b> {video_name}<br>Chainage: {float(start_row['Chainage'])}km<br>Frame: {start_row['Startframe']}<br>GPS: {start_row['Position']}",
+                    icon=folium.Icon(color="green", icon="play")
                 ).add_to(m)
-                added_markers.add(closest_chainage)
+                
+                # Add marker for the end frame
+                end_row = group.iloc[-1]
+                folium.Marker(
+                    location=(end_row['Latitude'], end_row['Longitude']),
+                    popup=f"<b>END:</b> {video_name}<br>Chainage: {float(end_row['Chainage'])}km<br>Frame: {end_row['Startframe']}<br>GPS: {end_row['Position']}",
+                    icon=folium.Icon(color="red", icon="stop")
+                ).add_to(m)
+                
+                # Draw a polyline for this specific video segment
+                folium.PolyLine(
+                    list(zip(group['Latitude'], group['Longitude'])), 
+                    color="purple", weight=2, opacity=0.8,
+                    popup=f"Video: {video_name}"
+                ).add_to(m)
 
         # Convert relevant data to JSON for JavaScript
         route_data = df[['Latitude', 'Longitude', 'Chainage', 'Startframe', 'Video_Name', 'Position']].to_json(orient='records')
