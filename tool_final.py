@@ -418,13 +418,15 @@ class VideoGPSProcessor:
             return None
 
 
-    def process_csv(self, input_file, output_file):
+    def process_csv(self, input_file, output_file, distance_threshold=100):
         """
-        Process the input CSV and generate cleaned data with improved handling of invalid GPS data
+        Process the input CSV and generate cleaned data with improved handling of invalid GPS data.
+        Removes inconsistent GPS coordinates with large jumps.
         
         Args:
             input_file (str): Path to input CSV
             output_file (str): Path to save processed CSV
+            distance_threshold (float): Maximum allowed distance between consecutive points in meters
         
         Returns:
             pd.DataFrame: Processed DataFrame
@@ -435,7 +437,6 @@ class VideoGPSProcessor:
         df['Valid_GPS'] = df['Position'].apply(self.is_valid_gps)
         
         # Extract latitude and longitude for all points
-        # For invalid points, this will set lat/lon to 0.0, which we'll handle with interpolation
         df[['Latitude', 'Longitude']] = df['Position'].apply(lambda pos: pd.Series(self.split(pos)))
         
         # Group by Video_Name to handle each video segment separately
@@ -443,6 +444,7 @@ class VideoGPSProcessor:
         processed_dfs = []
         
         for video_name, video_df in video_groups:
+            print(f"Processing video: {video_name}")
             video_df = video_df.reset_index(drop=True)
             
             # Skip videos with no valid GPS data
@@ -450,87 +452,144 @@ class VideoGPSProcessor:
                 print(f"Skipping {video_name} - no valid GPS data")
                 continue
                 
-            # For videos with some valid GPS data, interpolate missing values
+            # Filter out inconsistent GPS points using a sliding window approach
             if video_df['Valid_GPS'].sum() >= 2:
-                # Get indices of valid GPS points
+                # Initialize an array to track which points to keep
+                keep_points = np.ones(len(video_df), dtype=bool)
                 valid_indices = np.where(video_df['Valid_GPS'])[0]
                 
-                # Perform spline interpolation on latitude and longitude separately
+                if len(valid_indices) >= 2:
+                    # First pass: Mark points with large distance jumps
+                    for i in range(1, len(valid_indices)):
+                        prev_idx = valid_indices[i-1]
+                        curr_idx = valid_indices[i]
+                        
+                        lat1, lon1 = video_df.loc[prev_idx, ['Latitude', 'Longitude']]
+                        lat2, lon2 = video_df.loc[curr_idx, ['Latitude', 'Longitude']]
+                        
+                        # Calculate distance between consecutive valid points
+                        distance = self.haversine_distance(lat1, lon1, lat2, lon2)
+                        
+                        # If distance is too large, mark the current point as an outlier
+                        if distance > distance_threshold:
+                            print(f"Video {video_name}: Large distance detected ({distance:.2f}m) between frames {prev_idx} and {curr_idx}")
+                            
+                            # Determine which point is the outlier by checking neighboring points
+                            if i > 1 and i < len(valid_indices) - 1:
+                                # Check distances to neighbors
+                                prev_prev_idx = valid_indices[i-2]
+                                next_idx = valid_indices[i+1]
+                                
+                                lat_prev_prev = video_df.loc[prev_prev_idx, 'Latitude']
+                                lon_prev_prev = video_df.loc[prev_prev_idx, 'Longitude']
+                                lat_next = video_df.loc[next_idx, 'Latitude']
+                                lon_next = video_df.loc[next_idx, 'Longitude']
+                                
+                                # Calculate distances to determine which point is the outlier
+                                d1 = self.haversine_distance(lat_prev_prev, lon_prev_prev, lat1, lon1)
+                                d2 = self.haversine_distance(lat_prev_prev, lon_prev_prev, lat2, lon2)
+                                d3 = self.haversine_distance(lat2, lon2, lat_next, lon_next)
+                                
+                                if d2 > d1 and d2 > d3:
+                                    # Current point is likely the outlier
+                                    keep_points[curr_idx] = False
+                                    print(f"  Removing outlier at frame {curr_idx}")
+                                else:
+                                    # Previous point is likely the outlier
+                                    keep_points[prev_idx] = False
+                                    print(f"  Removing outlier at frame {prev_idx}")
+                            else:
+                                # If at the edges, simply mark the current point
+                                keep_points[curr_idx] = False
+                                print(f"  Removing outlier at frame {curr_idx}")
+                
+                # Filter out the points marked for removal
+                cleaned_video_df = video_df[keep_points].reset_index(drop=True)
+                
+                # Skip if we don't have enough points after cleaning
+                if cleaned_video_df['Valid_GPS'].sum() < 2:
+                    print(f"Not enough valid GPS points in {video_name} after cleaning")
+                    continue
+                    
+                # Get indices of remaining valid GPS points
+                valid_indices = np.where(cleaned_video_df['Valid_GPS'])[0]
+                
+                # Perform interpolation on cleaned data
                 if len(valid_indices) >= 4:  # Need at least 4 points for cubic spline
                     try:
                         # For latitude
                         lat_spline = CubicSpline(
                             valid_indices, 
-                            video_df.loc[valid_indices, 'Latitude']
+                            cleaned_video_df.loc[valid_indices, 'Latitude']
                         )
                         
                         # For longitude
                         lon_spline = CubicSpline(
                             valid_indices, 
-                            video_df.loc[valid_indices, 'Longitude']
+                            cleaned_video_df.loc[valid_indices, 'Longitude']
                         )
                         
                         # Apply interpolation to all indices
-                        all_indices = np.arange(len(video_df))
-                        video_df['Latitude'] = lat_spline(all_indices)
-                        video_df['Longitude'] = lon_spline(all_indices)
+                        all_indices = np.arange(len(cleaned_video_df))
+                        cleaned_video_df['Latitude'] = lat_spline(all_indices)
+                        cleaned_video_df['Longitude'] = lon_spline(all_indices)
                     except Exception as e:
                         print(f"Cubic spline interpolation failed for {video_name}: {e}")
                         # Fall back to linear interpolation
                         lat_interp = interp1d(
                             valid_indices, 
-                            video_df.loc[valid_indices, 'Latitude'],
+                            cleaned_video_df.loc[valid_indices, 'Latitude'],
                             bounds_error=False, 
                             fill_value='extrapolate'
                         )
                         
                         lon_interp = interp1d(
                             valid_indices, 
-                            video_df.loc[valid_indices, 'Longitude'],
+                            cleaned_video_df.loc[valid_indices, 'Longitude'],
                             bounds_error=False, 
                             fill_value='extrapolate'
                         )
                         
-                        video_df['Latitude'] = lat_interp(all_indices)
-                        video_df['Longitude'] = lon_interp(all_indices)
+                        cleaned_video_df['Latitude'] = lat_interp(all_indices)
+                        cleaned_video_df['Longitude'] = lon_interp(all_indices)
                 else:
                     # Linear interpolation for fewer points
                     lat_interp = interp1d(
                         valid_indices, 
-                        video_df.loc[valid_indices, 'Latitude'],
+                        cleaned_video_df.loc[valid_indices, 'Latitude'],
                         bounds_error=False, 
                         fill_value='extrapolate'
                     )
                     
                     lon_interp = interp1d(
                         valid_indices, 
-                        video_df.loc[valid_indices, 'Longitude'],
+                        cleaned_video_df.loc[valid_indices, 'Longitude'],
                         bounds_error=False, 
                         fill_value='extrapolate'
                     )
                     
-                    all_indices = np.arange(len(video_df))
-                    video_df['Latitude'] = lat_interp(all_indices)
-                    video_df['Longitude'] = lon_interp(all_indices)
+                    all_indices = np.arange(len(cleaned_video_df))
+                    cleaned_video_df['Latitude'] = lat_interp(all_indices)
+                    cleaned_video_df['Longitude'] = lon_interp(all_indices)
                 
                 # Recreate the Position column from interpolated coordinates
-                for idx in video_df.index:
-                    lat = video_df.loc[idx, 'Latitude']
-                    lon = video_df.loc[idx, 'Longitude']
+                for idx in cleaned_video_df.index:
+                    lat = cleaned_video_df.loc[idx, 'Latitude']
+                    lon = cleaned_video_df.loc[idx, 'Longitude']
                     pos = self.merge(lat, lon)
-                    video_df.loc[idx, 'Position'] = pos if pos else 'N0.00000E0.00000'
+                    cleaned_video_df.loc[idx, 'Position'] = pos if pos else 'N0.00000E0.00000'
                 
-                processed_dfs.append(video_df)
+                processed_dfs.append(cleaned_video_df)
             else:
                 # Not enough valid points for interpolation
                 print(f"Not enough valid GPS points in {video_name} for interpolation")
         
         # Combine processed video segments
-        if processed_dfs:
-            df = pd.concat(processed_dfs, ignore_index=True)
-        else:
+        if not processed_dfs:
             print("No videos with valid GPS data found")
             return None
+        
+        df = pd.concat(processed_dfs, ignore_index=True)
         
         # Select every 30th frame
         df = df[df['Frame'] % 30 == 0].reset_index(drop=True)
@@ -544,10 +603,10 @@ class VideoGPSProcessor:
         
         # Get last frame number per video
         last_frames = df.groupby('Video_Name')['Frame'].max().to_dict()
-      
+    
         # Replace -2 in Endframe with the last frame of the corresponding video
         df['Endframe'] = df.apply(lambda row: last_frames[row['Video_Name']] if row['Endframe'] == -2 else row['Endframe'], axis=1)
-                              
+                            
         # Calculate distances and cumulative chainage
         total_distance = 0
         for i in range(1, len(df)):
@@ -563,9 +622,9 @@ class VideoGPSProcessor:
                 
             distance = self.haversine_distance(lat1, lon1, lat2, lon2)
             
-            # Skip implausible distances (GPS jumps)
-            if distance > 500:  # More than 500 meters between frames likely indicates a GPS error
-                print(f"Large distance detected ({distance:.2f}m) at index {i}. Likely GPS error.")
+            # Skip implausible distances (GPS jumps) - these should be rare after our cleaning
+            if distance > distance_threshold:
+                print(f"Large distance still detected ({distance:.2f}m) at index {i}. Setting to zero.")
                 distance = 0
                 
             distance /= 1000  # Convert to kilometers
@@ -575,7 +634,7 @@ class VideoGPSProcessor:
         
         # Save processed data
         df_output = df[['Position', 'Startframe', 'Endframe', 'Speed', 'Video_Name', 
-                       'Gdist', 'Distance', 'Chainage', 'Latitude', 'Longitude']]
+                    'Gdist', 'Distance', 'Chainage', 'Latitude', 'Longitude']]
         df_output.to_csv(output_file, index=False)
         print(f"Processed data saved to {output_file}")
         
