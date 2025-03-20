@@ -16,10 +16,12 @@ import concurrent.futures
 
 
 class VideoGPSProcessor:
-    @staticmethod
-    def interpolate_gps_in_csv(csv_path, start_frame, end_frame, video_name, gps_coords):
+    #@staticmethod
+    def interpolate_gps_in_csv(self, csv_path, start_frame, end_frame, video_name, gps_coords):
         """
         Interpolates GPS points for a specific frame range and updates the CSV.
+        Creates frames if they don't exist in the given range using the pattern:
+        new_start_frame = prev_end_frame + 2
         """
         try:
             df = pd.read_csv(csv_path)
@@ -27,33 +29,116 @@ class VideoGPSProcessor:
             if not all(col in df.columns for col in required_columns):
                 raise ValueError(f"CSV must contain the following columns: {required_columns}")
 
+            # Filter for the specific video
             video_df = df[df['Video_Name'] == video_name].copy()
+            
+            if video_df.empty:
+                raise ValueError(f"No frames found for video '{video_name}'.")
             
             if start_frame > end_frame:
                 raise ValueError("Start frame must be less than or equal to end frame.")
 
-            max_frame = video_df['Endframe'].max()
-            if end_frame > max_frame:
-                print(f"Warning: End frame {end_frame} exceeds max frame {max_frame}. Using {max_frame} instead.")
-                end_frame = max_frame
+            # Check if requested range is within video's overall range
+            video_min_frame = video_df['Startframe'].min()
+            video_max_frame = video_df['Endframe'].max()
+            
+            if start_frame < video_min_frame or end_frame > video_max_frame:
+                raise ValueError(f"Requested frame range ({start_frame}-{end_frame}) is outside video range ({video_min_frame}-{video_max_frame}).")
 
+            # Validate GPS coordinates
             if not isinstance(gps_coords, list) or len(gps_coords) < 4 or len(gps_coords) % 2 != 0:
                 raise ValueError("GPS coordinates must be provided as lat1,lon1,lat2,lon2,... (at least 2 points).")
 
             coords = [(gps_coords[i], gps_coords[i + 1]) for i in range(0, len(gps_coords), 2)]
-            frames_to_interpolate = video_df[(video_df['Startframe'] >= start_frame) & (video_df['Endframe'] <= end_frame)]
-
-            if frames_to_interpolate.empty:
-                raise ValueError(f"No frames found in range {start_frame}-{end_frame} for video '{video_name}'.")
-
+            
+            # Check if frames exist in the range
+            frames_in_range = video_df[(video_df['Startframe'] >= start_frame) & (video_df['Startframe'] <= end_frame)]
+            
+            if frames_in_range.empty:
+                print(f"No existing frames found in range {start_frame}-{end_frame}. Creating new frames...")
+                
+                # Find the proper frames to insert between
+                frames_before = video_df[video_df['Startframe'] < start_frame].sort_values('Startframe')
+                frames_after = video_df[video_df['Startframe'] > end_frame].sort_values('Startframe')
+                
+                # Determine frame pattern
+                if not frames_before.empty and not frames_after.empty:
+                    # Get the pattern from existing data
+                    sample_frame = video_df.iloc[0]
+                    frame_interval = 30  # Default
+                    
+                    # Check if we can determine the pattern from the data
+                    if len(video_df) >= 2:
+                        # Calculate common difference between consecutive start frames
+                        diffs = video_df['Startframe'].diff().dropna()
+                        if not diffs.empty:
+                            frame_interval = int(diffs.mode().iloc[0])
+                        
+                        # Calculate common difference between start and end frames
+                        span = (video_df['Endframe'] - video_df['Startframe']).mode().iloc[0]
+                        frame_span = int(span)
+                    else:
+                        # Default pattern if we can't determine from data
+                        frame_span = 28  # Based on your sample where end - start = 28
+                
+                # Create new frames
+                new_frames = []
+                
+                # Find the closest frame before our range to use as reference
+                if not frames_before.empty:
+                    prev_frame = frames_before.iloc[-1]
+                    current_start = prev_frame['Endframe'] + 2
+                else:
+                    # If no frames before, use the requested start frame
+                    current_start = start_frame
+                    
+                    # Get default values from the nearest existing frame
+                    nearest_idx = (video_df['Startframe'] - start_frame).abs().idxmin()
+                    prev_frame = video_df.loc[nearest_idx].copy()
+                
+                # Create frames until we cover the requested range
+                while current_start <= end_frame:
+                    current_end = current_start + frame_span
+                    
+                    new_row = {
+                        'Position': prev_frame['Position'],
+                        'Startframe': current_start,
+                        'Endframe': current_end,
+                        'Speed': prev_frame['Speed'],
+                        'Video_Name': video_name,
+                        'Gdist': prev_frame['Gdist'],
+                        'Distance': 0.0,
+                        'Chainage': prev_frame['Chainage'],
+                        'Latitude': prev_frame['Latitude'],
+                        'Longitude': prev_frame['Longitude']
+                    }
+                    new_frames.append(new_row)
+                    
+                    # Update for next frame
+                    prev_frame = pd.Series(new_row)
+                    current_start = current_end + 2
+                
+                # Add the new frames to the dataframe
+                new_frames_df = pd.DataFrame(new_frames)
+                df = pd.concat([df, new_frames_df], ignore_index=True)
+                df = df.sort_values(by=['Video_Name', 'Startframe']).reset_index(drop=True)
+                
+                # Refilter to get our new frames for interpolation
+                video_df = df[df['Video_Name'] == video_name].copy()
+                frames_to_interpolate = video_df[(video_df['Startframe'] >= start_frame) & (video_df['Startframe'] <= end_frame)]
+            else:
+                frames_to_interpolate = frames_in_range
+            
+            # Get indices of frames to interpolate
             frame_indices = frames_to_interpolate.index
             frame_numbers = frames_to_interpolate['Startframe'].to_numpy()
-
+            
+            # Prepare the interpolation
             input_points = np.linspace(0, 1, len(coords))
             latitudes = np.array([coord[0] for coord in coords])
             longitudes = np.array([coord[1] for coord in coords])
             output_points = np.linspace(0, 1, len(frame_numbers))
-
+            
             try:
                 if len(coords) >= 4:
                     lat_spline = CubicSpline(input_points, latitudes)
@@ -68,15 +153,23 @@ class VideoGPSProcessor:
             except Exception as e:
                 print(f"Interpolation failed: {e}")
                 return df
-
+        
+            # Update the dataframe with interpolated values
             df.loc[frame_indices, 'Latitude'] = interp_latitudes
             df.loc[frame_indices, 'Longitude'] = interp_longitudes
-            df.loc[frame_indices, 'Position'] = [f"N{lat}E{lon}" for lat, lon in zip(interp_latitudes, interp_longitudes)]
-
+            
+            # Format position strings properly
+            positions = []
+            for lat, lon in zip(interp_latitudes, interp_longitudes):
+                lat_str = f"{lat:.6f}"
+                lon_str = f"{lon:.6f}"
+                positions.append(f"N{lat_str}E{lon_str}")
+            
+            df.loc[frame_indices, 'Position'] = positions
+            
             print(f"Interpolation completed for frames {start_frame}-{end_frame} in video '{video_name}'.")
             return df
         
-
         except Exception as e:
             print(f"Error in interpolate_gps_in_csv: {str(e)}")
             return df
@@ -418,7 +511,7 @@ class VideoGPSProcessor:
             return None
 
 
-    def process_csv(self, input_file, output_file, distance_threshold=100):
+    def process_csv(self, input_file, output_file, road_side,ini_chainage):
         """
         Process the input CSV and generate cleaned data with improved handling of invalid GPS data.
         Removes inconsistent GPS coordinates with large jumps.
@@ -431,6 +524,8 @@ class VideoGPSProcessor:
         Returns:
             pd.DataFrame: Processed DataFrame
         """
+        print("processing csv")
+        distance_threshold=100
         df = pd.read_csv(input_file)
         
         # Clean and identify valid GPS positions
@@ -602,13 +697,18 @@ class VideoGPSProcessor:
         df['Chainage'] = 0.0
         
         # Get last frame number per video
-        last_frames = df.groupby('Video_Name')['Frame'].max().to_dict()
-    
-        # Replace -2 in Endframe with the last frame of the corresponding video
-        df['Endframe'] = df.apply(lambda row: last_frames[row['Video_Name']] if row['Endframe'] == -2 else row['Endframe'], axis=1)
-                            
-        # Calculate distances and cumulative chainage
-        total_distance = 0
+        last_frames = df.groupby('Video_Name')['Frame'].max().to_dict()    
+        if road_side == "RHS":
+            # Fix endframes on a row-by-row basis
+            df['Endframe'] = df.apply(lambda row: row['Startframe'] if row['Endframe'] < row['Startframe'] else row['Endframe'], axis=1)
+            total_distance = ini_chainage
+            df['Chainage'] = total_distance
+        else:
+            # Replace -2 in Endframe with the last frame of the corresponding video
+            df['Endframe'] = df.apply(lambda row: last_frames[row['Video_Name']] if row['Endframe'] == -2 else row['Endframe'], axis=1)
+            total_distance=0
+            
+                    
         for i in range(1, len(df)):
             lat1, lon1 = df.loc[i - 1, ['Latitude', 'Longitude']]
             lat2, lon2 = df.loc[i, ['Latitude', 'Longitude']]
@@ -629,7 +729,10 @@ class VideoGPSProcessor:
                 
             distance /= 1000  # Convert to kilometers
             df.loc[i, 'Distance'] = distance
-            total_distance += distance
+            if road_side == "RHS":
+                total_distance-=distance
+            else:
+                total_distance += distance
             df.loc[i, 'Chainage'] = total_distance
         
         # Save processed data
@@ -640,7 +743,7 @@ class VideoGPSProcessor:
         
         return df_output
 
-    def delete_frames(self, file_path, video_name, start_frame, end_frame):
+    def delete_frames(self, file_path, video_name, start_frame, end_frame,road_side,ini_chainage):
         """
         Delete specified frames and update the CSV
         
@@ -662,7 +765,7 @@ class VideoGPSProcessor:
         df_filtered = df[mask].reset_index(drop=True)
         
         # Recalculate chainage after deletion
-        df_filtered = self.recalculate_chainage(df_filtered)
+        df_filtered = self.recalculate_chainage(df_filtered,road_side,ini_chainage)
         
         # Save updated CSV (overwrite original)
         df_filtered.to_csv(file_path, index=False)
@@ -671,7 +774,7 @@ class VideoGPSProcessor:
         
         return df_filtered
 
-    def recalculate_chainage(self, df):
+    def recalculate_chainage(self, df,road_side, ini_chainage):
         """
         Recalculate chainage after frame deletion with improved handling of invalid GPS
         
@@ -681,8 +784,19 @@ class VideoGPSProcessor:
         Returns:
             pd.DataFrame: DataFrame with updated chainage
         """
-        total_distance = 0
-        df['Chainage'] = 0.0 
+        
+        #last_frames = df.groupby('Video_Name')['Startframe'].max().to_dict()    
+        if road_side == "RHS":
+            # Fix endframes on a row-by-row basis
+            #df['Endframe'] = df.apply(lambda row: row['Startframe'] if row['Endframe'] < row['Startframe'] else row['Endframe'], axis=1)
+            total_distance = ini_chainage
+            df['Chainage'] = total_distance
+        else:
+            # Replace -2 in Endframe with the last frame of the corresponding video
+            #df['Endframe'] = df.apply(lambda row: last_frames[row['Video_Name']] if row['Endframe'] == -2 else row['Endframe'], axis=1)
+            total_distance=0
+
+        df['Chainage'] = total_distance
         
         for i in range(1, len(df)):
             lat1, lon1 = df.loc[i - 1, ['Latitude', 'Longitude']]
@@ -703,7 +817,10 @@ class VideoGPSProcessor:
                 
             distance /= 1000  # Convert to kilometers
             df.loc[i, 'Distance'] = distance
-            total_distance += distance
+            if road_side =="RHS":
+                total_distance-=distance
+            else:
+                total_distance += distance
             df.loc[i, 'Chainage'] = total_distance
         
         return df
@@ -887,14 +1004,14 @@ class VideoGPSProcessor:
         m.save(output_html)
         print(f"Map saved as {output_html}.")
         return output_html
-def process_and_generate_map(csv_path, start_frame, end_frame, video_name, gps_coords):
+def process_and_generate_map(csv_path, start_frame, end_frame, video_name, gps_coords,road_side, ini_chainage):
     interpolator = VideoGPSProcessor()
     
     # Read the CSV file and perform interpolation
     df = interpolator.interpolate_gps_in_csv(csv_path, start_frame, end_frame, video_name, gps_coords)
     
     # Recalculate chainage
-    df = interpolator.recalculate_chainage(df)
+    df = interpolator.recalculate_chainage(df,road_side,ini_chainage)
     
     # Extract the directory path from the input CSV path
     output_dir = os.path.dirname(csv_path)
@@ -927,11 +1044,15 @@ def create_gradio_interface():
         with gr.Tab("Process Videos"):
             with gr.Row():
                 directory_input = gr.Textbox(label="Video Directory Path")
+                ini_chainage=gr.Number(label="Initial Chainage", minimum=0.0, value=0.0)
+                road_side = gr.Radio(
+                choices=["LHS",  "RHS"],
+                    label="Select a road side" )
                 process_btn = gr.Button("Process Videos")
             
             process_btn.click(
-                fn=lambda directory: processor.process_videos(directory),
-                inputs=directory_input,
+                fn=lambda directory,road_side,ini_chainage: processor.process_videos(directory,road_side,ini_chainage),
+                inputs=[directory_input,road_side, ini_chainage],
                 outputs=status_output
             )
         
@@ -942,16 +1063,21 @@ def create_gradio_interface():
                 video_name_input = gr.Textbox(label="Video Name")
                 start_frame_input = gr.Number(label="Start Frame", minimum=0)
                 end_frame_input = gr.Number(label="End Frame", minimum=0)
+                ini_chainage=gr.Number(label="Initial Chainage", minimum=0.0, value=0.0)
+                road_side = gr.Radio(
+                choices=["LHS",  "RHS"],
+                    label="Select a road side" )
                 delete_frames_btn = gr.Button("Delete Frames")
             
             delete_frames_btn.click(
-                fn=lambda csv_path, video_name, start_frame, end_frame: 
-                    processor.delete_video_frames(csv_path, video_name, start_frame, end_frame),
+                fn=lambda csv_path, video_name, start_frame, end_frame,road_side,ini_chainage:
+                    processor.delete_video_frames(csv_path, video_name, start_frame, end_frame,road_side,ini_chainage),
                 inputs=[
                     csv_path_del_input, 
                     video_name_input, 
                     start_frame_input, 
-                    end_frame_input
+                    end_frame_input,
+                    road_side,ini_chainage
                 ],
                 outputs=status_output
             )
@@ -963,30 +1089,35 @@ def create_gradio_interface():
                 start_frame_interp_input = gr.Number(label="Start Frame", minimum=0)
                 end_frame_interp_input = gr.Number(label="End Frame", minimum=0)
                 gps_points_input = gr.Textbox(label="GPS Points (Format: lat1,lon1,lat2,lon2,...)")
+                ini_chainage=gr.Number(label="Initial Chainage", minimum=0.0, value=0.0)
+                road_side = gr.Radio(
+                choices=["LHS",  "RHS"],
+                    label="Select a road side" )
+
                 process_and_generate_map_btn = gr.Button("Process and Generate Map")
             
             process_and_generate_map_btn.click(
-                fn=lambda csv_path, video_name, start_frame, end_frame, gps_points: 
+                fn=lambda csv_path, video_name, start_frame, end_frame, gps_points,road_side,ini_chainage: 
                     process_and_generate_map(
                         csv_path, 
                         start_frame, 
                         end_frame, 
                         video_name, 
-                        [float(coord) for coord in gps_points.split(',')]
+                        [float(coord) for coord in gps_points.split(',')],road_side,ini_chainage
                     ),
                 inputs=[
                     csv_path_interp_input, 
                     video_name_interp_input, 
                     start_frame_interp_input, 
                     end_frame_interp_input, 
-                    gps_points_input
+                    gps_points_input,road_side,ini_chainage
                 ],
                 outputs=status_output
             )
     
     return demo
 
-def process_videos(self, directory_path):
+def process_videos(self, directory_path,road_side, ini_chainage):
     """
     Comprehensive video processing workflow for videos in a directory and its subdirectories.
     
@@ -1044,7 +1175,7 @@ def process_videos(self, directory_path):
 
         # Process combined CSV and save it in the maps folder
         processed_csv_path = os.path.join(maps_folder, 'processed_output.csv')
-        processed_df = self.process_csv(combined_csv_path, processed_csv_path)
+        processed_df = self.process_csv(combined_csv_path, processed_csv_path,road_side,ini_chainage)
 
         # Generate and open map
         map_path = os.path.join(maps_folder, 'processed_output_map.html')
@@ -1062,7 +1193,7 @@ def process_videos(self, directory_path):
         return f"Error processing videos: {str(e)}"
 
 
-def delete_video_frames(self, csv_path, video_name, start_frame, end_frame):
+def delete_video_frames(self, csv_path, video_name, start_frame, end_frame,road_side,ini_chainage):
     """
     Delete frames and provide status
     
@@ -1087,7 +1218,7 @@ def delete_video_frames(self, csv_path, video_name, start_frame, end_frame):
             return "Start frame must be less than or equal to end frame"
 
         # Delete frames
-        self.delete_frames(csv_path, video_name, start_frame, end_frame)
+        self.delete_frames(csv_path, video_name, start_frame, end_frame,road_side,ini_chainage)
         
         # Regenerate the map
         map_path = csv_path.replace('.csv', '_map.html')
